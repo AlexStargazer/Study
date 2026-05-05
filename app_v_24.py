@@ -1839,10 +1839,12 @@ with gr.Blocks(
                    outputs=[msg, chatbot, session, uuid_bridge, msg, send_btn])
 
 if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 7860))
     demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
         theme=gr.themes.Default(primary_hue="slate", neutral_hue="slate", radius_size="sm"),
         css=CSS,
-        # Gradio 6: show_api удалён, заменён на footer_links.
-        # Чтобы скрыть ссылку API из футера: указываем список без "api".
         footer_links=["gradio", "settings"],
     )
