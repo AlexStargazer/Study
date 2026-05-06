@@ -1343,6 +1343,48 @@ def _generate_first_turn(session_state: dict) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 # Обработка сообщений — диспетчер по стадиям
 # ─────────────────────────────────────────────────────────────────────────────
+def _force_end_game(session_state: dict):
+    """Принудительное завершение когда модель не поставила END_GAME на ходу 10+.
+    Логирует факт, помечает сессию завершённой, показывает финальное сообщение."""
+    gs: GameState = session_state.get("game_state")
+    ts = datetime.now().isoformat()
+
+    logging.warning("Force-ending game: participant=%s, scenario=%s, turn=%s",
+                    session_state.get("participant_code"),
+                    gs.scenario_name if gs else "?",
+                    gs.turn if gs else "?")
+
+    forced_row = [ts, "SYSTEM",
+                  f"GAME_FORCE_ENDED: turn={gs.turn if gs else '?'}, "
+                  f"model_failed_to_end",
+                  gs.scenario_name if gs else "", gs.turn if gs else 0, ""]
+    try:
+        with open(session_state["log_file"], "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(forced_row)
+    except Exception:
+        pass
+    enqueue_gsheet([[forced_row[0], forced_row[1], forced_row[2],
+                     forced_row[3], forced_row[4], forced_row[5]]])
+
+    try:
+        mark_completed(session_state["participant_code"])
+    except Exception:
+        pass
+
+    session_state["game_ended"] = True
+
+    end_msg = (
+        "Сценарий завершён.\n\n---\n"
+        "**Спасибо за участие в исследовании!**\n"
+        "Ваши ответы записаны. Окно можно закрыть."
+    )
+    chat_display = session_state.get("chat_display", []) + [
+        {"role": "assistant", "content": end_msg}
+    ]
+    session_state["chat_display"] = chat_display
+    return "", chat_display, session_state
+
+
 def respond(message: str, session_state: dict):
     """Главный обработчик. Маршрутизирует сообщения в зависимости от стадии сессии."""
     try:
@@ -1373,6 +1415,10 @@ def respond(message: str, session_state: dict):
             return "", disp, new_state
 
         if stage == "playing":
+            # Жёсткий лимит: если модель не завершила на ходу 10 — завершаем принудительно
+            gs = session_state.get("game_state")
+            if gs and gs.turn >= 10 and not session_state.get("game_ended"):
+                return _force_end_game(session_state)
             return _process_turn(message, session_state)
 
         return "", session_state.get("chat_display", []), session_state
@@ -1906,7 +1952,7 @@ if __name__ == "__main__":
     demo.launch(
         theme=gr.themes.Default(primary_hue="slate", neutral_hue="slate", radius_size="sm"),
         css=CSS,
-        # Gradio 6: show_api удалён, заменён на footer_links.
-        # Чтобы скрыть ссылку API из футера: указываем список без "api".
         footer_links=["gradio", "settings"],
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
     )
