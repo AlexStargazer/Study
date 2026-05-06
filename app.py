@@ -16,9 +16,12 @@ import gradio as gr
 
 # ── Логирование ошибок в файл ────────────────────────────────────────────────
 logging.basicConfig(
-    filename="app_errors.log",
-    level=logging.ERROR,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler("app_errors.log"),
+        logging.StreamHandler(),   # вывод в stdout — виден в логах Render
+    ],
 )
 
 # ── Ключ API ──────────────────────────────────────────────────────────────────
@@ -165,7 +168,7 @@ def strip_all_tags(text: str) -> str:
 OUTPUT_DIR     = "quest_logs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 COMPLETED_FILE = "completed_codes.txt"
-PROMPT_VERSION = "26.0"
+PROMPT_VERSION = "27.0"
 TEMPERATURE    = 0.4
 MAX_HISTORY    = 40
 MAX_USER_MSG   = 4000
@@ -421,12 +424,17 @@ def _append_reserved(code: str, scenario_idx: int, events: list):
 def _remove_reserved(code: str):
     if not os.path.exists(RESERVED_FILE):
         return
-    with open(RESERVED_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    with open(RESERVED_FILE, "w", encoding="utf-8") as f:
-        for line in lines:
-            if not line.startswith(code + "\t"):
-                f.write(line)
+    try:
+        with open(RESERVED_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        tmp = RESERVED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for line in lines:
+                if not line.startswith(code + "\t"):
+                    f.write(line)
+        os.replace(tmp, RESERVED_FILE)  # атомарная замена
+    except Exception as e:
+        logging.error("_remove_reserved error: %s", e)
 
 def reserve_or_resume(code: str) -> Optional[dict]:
     """
@@ -473,9 +481,11 @@ def _cleanup_stale_reservations():
                         if ts >= cutoff:
                             kept_lines.append(line)
                     except ValueError:
-                        kept_lines.append(line)  # некорректный timestamp — оставляем
-        with open(RESERVED_FILE, "w", encoding="utf-8") as f:
+                        kept_lines.append(line)
+        tmp = RESERVED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(kept_lines)
+        os.replace(tmp, RESERVED_FILE)  # атомарная замена
     except Exception as e:
         logging.error("Stale reservation cleanup error: %s", e)
 
@@ -593,6 +603,14 @@ def build_state_block(gs: GameState) -> str:
             f"Виктор признался в отлучке: {'да' if gs.confessed else 'нет'}",
             f"Решение детектива: {gs.final_decision or 'не принято'}",
         ]
+
+        # Финальная фаза после признания: Виктор не отрицает факты
+        if gs.confessed:
+            lines.append(
+                "ФИНАЛЬНАЯ ФАЗА: Виктор признался. Он больше не отрицает отлучку — "
+                "только объясняет или уточняет детали. Возврат к отрицанию невозможен. "
+                "Диалог движется к развязке."
+            )
         # На ходу 10 — форсируем прямой вопрос о решении
         if gs.turn == 10 and not gs.final_decision:
             lines.append(
@@ -775,7 +793,7 @@ SCENARIOS = [
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 26.0 | Сценарий: Управление проектом
+VERSION: 27.0 | Сценарий: Управление проектом
 
 Ты — оператор исследовательской симуляции. Не драматизируй, не развлекай.
 
@@ -824,7 +842,7 @@ VERSION: 26.0 | Сценарий: Управление проектом
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 26.0 | Сценарий: Межпланетная миссия
+VERSION: 27.0 | Сценарий: Межпланетная миссия
 
 Ты — оператор исследовательской симуляции. Без драматизации.
 
@@ -864,7 +882,7 @@ VERSION: 26.0 | Сценарий: Межпланетная миссия
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 26.0 | Сценарий: Кризисное управление
+VERSION: 27.0 | Сценарий: Кризисное управление
 
 Ты — оператор исследовательской симуляции. Без драматизации.
 
@@ -907,7 +925,7 @@ VERSION: 26.0 | Сценарий: Кризисное управление
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 26.0 | Сценарий: Разговор с информантом
+VERSION: 27.0 | Сценарий: Разговор с информантом
 
 Ты — Виктор, охранник музея, 54 года.
 Ты не ведущий и не ИИ-помощник. Только человек на допросе.
@@ -1002,7 +1020,7 @@ VERSION: 26.0 | Сценарий: Разговор с информантом
     ),
     "resource_start": 1,
     "prompt": """\
-VERSION: 26.0 | Сценарий: Борьба с вирусом
+VERSION: 27.0 | Сценарий: Борьба с вирусом
 
 Ты — оператор исследовательской симуляции. Без драматизации.
 
@@ -1184,10 +1202,17 @@ def handle_consent(message: str, session_state: dict):
         ]
         return session_state, disp
 
-    # Согласие получено — генерируем UUID и резервируем сценарий
+    # Генерируем UUID с защитой от теоретического бесконечного цикла
     code = _generate_participant_id()
     reservation = reserve_or_resume(code)
+    attempts = 0
     while reservation is None:
+        attempts += 1
+        if attempts > 20:
+            logging.error("Failed to generate unique participant ID after 20 attempts")
+            msg = "Не удалось начать сессию. Пожалуйста, обратитесь к исследователю."
+            disp = session_state["chat_display"] + [{"role": "assistant", "content": msg}]
+            return session_state, disp
         code = _generate_participant_id()
         reservation = reserve_or_resume(code)
 
