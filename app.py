@@ -1360,7 +1360,8 @@ def _generate_first_turn(session_state: dict) -> tuple:
     enqueue_gsheet(log_rows)
 
     chat_display = session_state["chat_display"] + [
-        {"role": "assistant", "content": bot_reply_display}
+        {"role": "assistant", "content": "---"},
+        {"role": "assistant", "content": bot_reply_display},
     ]
     session_state["chat_display"] = chat_display
     return session_state, chat_display
