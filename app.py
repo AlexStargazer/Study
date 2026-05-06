@@ -31,6 +31,23 @@ _gsheets_configured = bool(os.environ.get("GOOGLE_SHEETS_KEY") and os.environ.ge
 logging.info("Startup: DeepSeek API configured. Google Sheets: %s",
              "configured" if _gsheets_configured else "NOT configured (check env vars)")
 
+# Тестовая запись при старте — если Sheets не пишет, сразу видно в логах Render
+if _gsheets_configured:
+    def _test_sheets_on_startup():
+        import time; time.sleep(3)  # ждём пока воркер запустится
+        test_row = [[datetime.now().isoformat(), "SYSTEM", "STARTUP_TEST", "", "", ""]]
+        try:
+            sheet = _get_gsheet_client()
+            if sheet:
+                sheet.append_rows(test_row, value_input_option="RAW")
+                logging.info("Google Sheets: startup test write OK")
+            else:
+                logging.error("Google Sheets: startup test FAILED — client is None")
+        except Exception as e:
+            logging.error("Google Sheets: startup test FAILED — %s", e)
+    import threading as _t
+    _t.Thread(target=_test_sheets_on_startup, daemon=True).start()
+
 client = OpenAI(
     api_key=api_key,
     base_url="https://api.deepseek.com/v1",
@@ -75,7 +92,9 @@ class LogEvent:
     OFF_TOPIC_PERSISTENT  = "OFF_TOPIC_PERSISTENT"
     CONSENT_GIVEN         = "CONSENT_GIVEN"
     PRE_SESSION           = "PRE_SESSION"
-    EVENT_TRIGGERED       = "EVENT_TRIGGERED"
+    EVENT_TRIGGERED            = "EVENT_TRIGGERED"
+    PASSIVE_STRATEGY           = "PASSIVE_STRATEGY"
+    PASSIVE_STRATEGY_PERSISTENT = "PASSIVE_STRATEGY_PERSISTENT"
 
 import re
 
@@ -146,7 +165,7 @@ def strip_all_tags(text: str) -> str:
 OUTPUT_DIR     = "quest_logs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 COMPLETED_FILE = "completed_codes.txt"
-PROMPT_VERSION = "25.0"
+PROMPT_VERSION = "26.0"
 TEMPERATURE    = 0.4
 MAX_HISTORY    = 40
 MAX_USER_MSG   = 4000
@@ -233,9 +252,16 @@ def _get_gsheet_client():
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
     if not key_json or not sheet_id:
         return None
-    import gspread
-    gc = gspread.service_account_from_dict(json.loads(key_json))
-    return gc.open_by_key(sheet_id).sheet1
+    try:
+        import gspread
+        gc = gspread.service_account_from_dict(json.loads(key_json))
+        return gc.open_by_key(sheet_id).sheet1
+    except json.JSONDecodeError as e:
+        logging.error("GOOGLE_SHEETS_KEY is not valid JSON: %s", e)
+        return None
+    except Exception as e:
+        logging.error("Google Sheets connection failed: %s", e)
+        return None
 
 def _gsheet_worker():
     """Один воркер обрабатывает все записи в Google Sheets последовательно.
@@ -256,42 +282,6 @@ def _gsheet_worker():
             sheet = None  # форсируем пересоздание клиента на следующей итерации
         finally:
             _log_queue.task_done()
-
-# Синхронная запись для критичных событий — обходит очередь.
-# Используется для SESSION_STARTED, GAME_ENDED, CONSENT_GIVEN —
-# чтобы гарантировать сохранение даже при перезапуске контейнера.
-# Имеет жёсткий таймаут, чтобы не блокировать ход надолго.
-_sync_sheet_client = None
-_sync_sheet_lock   = threading.Lock()
-SYNC_GSHEET_TIMEOUT = 5.0
-
-def append_to_gsheet_sync(rows: list):
-    """Пытается записать строки синхронно. Возвращает True при успехе.
-    На сбой возвращает False и НЕ ставит в очередь (вызывающий решает что делать)."""
-    global _sync_sheet_client
-    result = [False]
-
-    def _do_write():
-        global _sync_sheet_client
-        try:
-            with _sync_sheet_lock:
-                if _sync_sheet_client is None:
-                    _sync_sheet_client = _get_gsheet_client()
-                if _sync_sheet_client:
-                    _sync_sheet_client.append_rows(rows, value_input_option="RAW")
-                    result[0] = True
-        except Exception as e:
-            logging.error("Sync GSheets write failed: %s", e)
-            with _sync_sheet_lock:
-                _sync_sheet_client = None  # сбрасываем для пересоздания
-
-    t = threading.Thread(target=_do_write, daemon=True)
-    t.start()
-    t.join(timeout=SYNC_GSHEET_TIMEOUT)
-    if t.is_alive():
-        logging.error("Sync GSheets write timed out after %ss", SYNC_GSHEET_TIMEOUT)
-        return False
-    return result[0]
 
 # Запускаем воркер один раз при старте
 _worker_thread = threading.Thread(target=_gsheet_worker, daemon=True)
@@ -785,7 +775,7 @@ SCENARIOS = [
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 25.0 | Сценарий: Управление проектом
+VERSION: 26.0 | Сценарий: Управление проектом
 
 Ты — оператор исследовательской симуляции. Не драматизируй, не развлекай.
 
@@ -834,7 +824,7 @@ VERSION: 25.0 | Сценарий: Управление проектом
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 25.0 | Сценарий: Межпланетная миссия
+VERSION: 26.0 | Сценарий: Межпланетная миссия
 
 Ты — оператор исследовательской симуляции. Без драматизации.
 
@@ -874,7 +864,7 @@ VERSION: 25.0 | Сценарий: Межпланетная миссия
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 25.0 | Сценарий: Кризисное управление
+VERSION: 26.0 | Сценарий: Кризисное управление
 
 Ты — оператор исследовательской симуляции. Без драматизации.
 
@@ -917,7 +907,7 @@ VERSION: 25.0 | Сценарий: Кризисное управление
     ),
     "resource_start": 0,
     "prompt": """\
-VERSION: 25.0 | Сценарий: Разговор с информантом
+VERSION: 26.0 | Сценарий: Разговор с информантом
 
 Ты — Виктор, охранник музея, 54 года.
 Ты не ведущий и не ИИ-помощник. Только человек на допросе.
@@ -1012,7 +1002,7 @@ VERSION: 25.0 | Сценарий: Разговор с информантом
     ),
     "resource_start": 1,
     "prompt": """\
-VERSION: 25.0 | Сценарий: Борьба с вирусом
+VERSION: 26.0 | Сценарий: Борьба с вирусом
 
 Ты — оператор исследовательской симуляции. Без драматизации.
 
@@ -1122,8 +1112,10 @@ def detect_injection(text: str) -> bool:
 def init_ui():
     """Начальный экран: показывает информированное согласие."""
     state = {
-        "stage":         "awaiting_consent",
-        "chat_display":  [{"role": "assistant", "content": INFORMED_CONSENT}],
+        "stage":           "awaiting_consent",
+        "chat_display":    [{"role": "assistant", "content": INFORMED_CONSENT}],
+        "off_topic_count": 0,
+        "passive_count":   0,
     }
     return state, state["chat_display"]
 
@@ -1273,6 +1265,7 @@ def _bootstrap_session(code, reservation, session_state, user_message,
         "last_user_turn":   None,
         "briefing_shown_at": datetime.now().isoformat(),  # для метрики time-to-first-action
         "off_topic_count":  0,
+        "passive_count":    0,
         "chat_display":     [
             {"role": "assistant", "content": intro_msg},
         ],
@@ -1352,37 +1345,49 @@ def _generate_first_turn(session_state: dict) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 def respond(message: str, session_state: dict):
     """Главный обработчик. Маршрутизирует сообщения в зависимости от стадии сессии."""
-    # Защита от потери session_state (перезапуск сервера, засыпание Render)
-    if not session_state or not isinstance(session_state, dict):
-        fresh_state, fresh_disp = init_ui()
-        return "", fresh_disp, fresh_state
+    try:
+        # Защита от потери session_state (перезапуск сервера, засыпание Render)
+        if not session_state or not isinstance(session_state, dict):
+            fresh_state, fresh_disp = init_ui()
+            return "", fresh_disp, fresh_state
 
-    if not message or not message.strip():
+        if not message or not message.strip():
+            return "", session_state.get("chat_display", []), session_state
+
+        # Если игра уже завершена — игнорируем ввод (не показываем ошибки)
+        if session_state.get("game_ended"):
+            return "", session_state.get("chat_display", []), session_state
+
+        # На стадии awaiting_consent ограничение на длину неактуально
+        stage = session_state.get("stage", "awaiting_consent")
+
+        if stage == "playing" and len(message) > MAX_USER_MSG:
+            return (
+                f"Сообщение слишком длинное (максимум {MAX_USER_MSG} символов).",
+                session_state["chat_display"],
+                session_state,
+            )
+
+        if stage == "awaiting_consent":
+            new_state, disp = handle_consent(message, session_state)
+            return "", disp, new_state
+
+        if stage == "playing":
+            return _process_turn(message, session_state)
+
         return "", session_state.get("chat_display", []), session_state
 
-    # Если игра уже завершена — игнорируем ввод (не показываем ошибки)
-    if session_state.get("game_ended"):
-        return "", session_state.get("chat_display", []), session_state
-
-    # На стадии awaiting_consent ограничение на длину неактуально
-    stage = session_state.get("stage", "awaiting_consent")
-
-    if stage == "playing" and len(message) > MAX_USER_MSG:
-        return (
-            f"Сообщение слишком длинное (максимум {MAX_USER_MSG} символов).",
-            session_state["chat_display"],
-            session_state,
-        )
-
-    if stage == "awaiting_consent":
-        new_state, disp = handle_consent(message, session_state)
-        return "", disp, new_state
-
-    if stage == "playing":
-        return _process_turn(message, session_state)
-
-    # На всякий случай: неизвестная стадия — возвращаем как есть
-    return "", session_state.get("chat_display", []), session_state
+    except Exception as e:
+        # Перехватываем любое исключение — Gradio не должен показывать красную «Ошибку»
+        logging.error("respond() unhandled exception: %s", e, exc_info=True)
+        try:
+            disp = session_state.get("chat_display", []) if session_state else []
+            error_msg = "[Произошла техническая ошибка. Пожалуйста, повторите действие.]"
+            disp = disp + [{"role": "assistant", "content": error_msg}]
+            return "", disp, session_state
+        except Exception:
+            fresh_state, fresh_disp = init_ui()
+            return "", fresh_disp, fresh_state
 
 def _process_turn(message: str, session_state: dict):
     """Игровой ход: запрос к LLM, обновление state, логирование."""
@@ -1420,6 +1425,15 @@ def _process_turn(message: str, session_state: dict):
         r"^\s*стоп[\s\.\!]*$",  # одиночное «стоп»
     ]
     _is_off_topic = any(re.search(p, msg_lower) for p in OFF_TOPIC_PATTERNS)
+
+    # Пассивная стратегия — ожидание/наблюдение без действия.
+    # Три подряд → PASSIVE_STRATEGY_PERSISTENT. Логируется только при успехе API.
+    PASSIVE_PATTERNS = [
+        r"\b(жд[уёё]|подожд|ожидаю|наблюдаю|выжидаю|ничего не делаю)\b",
+        r"\b(пока подожд|буду ждать|продолжаю ждать|ничего не предпринимаю)\b",
+        r"^(жду|жди|ждём|ок|окей|ладно|посмотрим|нет|-)[\s\.\!\?]*$",
+    ]
+    _is_passive = any(re.search(p, msg_lower) for p in PASSIVE_PATTERNS)
 
     # Собираем историю для запроса с временным сообщением пользователя.
     # Из ответов ассистента вырезаем служебные теги — модель не должна видеть
@@ -1519,6 +1533,15 @@ def _process_turn(message: str, session_state: dict):
                          f"{event}: {message[:200]}", "", gs.turn, ""])
     else:
         session_state["off_topic_count"] = 0
+
+    if _is_passive:
+        p_count = session_state.get("passive_count", 0) + 1
+        session_state["passive_count"] = p_count
+        p_event = LogEvent.PASSIVE_STRATEGY_PERSISTENT if p_count >= 3 else LogEvent.PASSIVE_STRATEGY
+        log_rows.append([datetime.now().isoformat(), "SYSTEM",
+                         f"{p_event}: turn={gs.turn}, msg={message[:100]}", "", gs.turn, ""])
+    else:
+        session_state["passive_count"] = 0
 
     # Время от брифинга до первого действия
     if gs.turn == 1 and session_state.get("briefing_shown_at"):
@@ -1777,7 +1800,7 @@ HIDE_JS = """
     //    сохраняем его в localStorage.
     const saveBridgeObserver = new MutationObserver(() => {
         const bridge = document.querySelector('#uuid-bridge textarea, #uuid-bridge input');
-        if (bridge && bridge.value && /^[a-f0-9]{8}$/i.test(bridge.value)) {
+        if (bridge && bridge.value && /^[a-f0-9]{12}$/i.test(bridge.value)) {
             try { localStorage.setItem('research_session_id', bridge.value); } catch (e) {}
         }
     });
@@ -1790,7 +1813,7 @@ HIDE_JS = """
     //    и срабатывает submit.
     try {
         const savedId = localStorage.getItem('research_session_id');
-        if (savedId && /^[a-f0-9]{8}$/i.test(savedId)) {
+        if (savedId && /^[a-f0-9]{12}$/i.test(savedId)) {
             setTimeout(() => {
                 const textarea = document.querySelector('#main-input textarea');
                 if (textarea) {
@@ -1809,14 +1832,23 @@ HIDE_JS = """
         }
     } catch (e) {}
 
-    // 3. После завершения сессии (видимость финальной плашки) — чистим localStorage
-    const cleanupObserver = new MutationObserver(() => {
+    // 3. После завершения — блокируем поле ввода и кнопку, чистим localStorage
+    const endObserver = new MutationObserver(() => {
         const text = document.body.innerText || "";
         if (text.indexOf('Спасибо за участие в исследовании') !== -1) {
             try { localStorage.removeItem('research_session_id'); } catch (e) {}
+            const textarea = document.querySelector('#main-input textarea');
+            const btn = document.querySelector('#send-btn');
+            if (textarea) {
+                textarea.disabled = true;
+                textarea.placeholder = 'Сессия завершена.';
+                textarea.style.opacity = '0.5';
+            }
+            if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; }
+            endObserver.disconnect();
         }
     });
-    cleanupObserver.observe(document.body, {childList: true, subtree: true, characterData: true});
+    endObserver.observe(document.body, {childList: true, subtree: true, characterData: true});
 }
 """
 
@@ -1861,30 +1893,20 @@ with gr.Blocks(
     def _respond_with_uuid(message, session_state):
         msg_out, disp, new_state = respond(message, session_state)
         uuid_value = new_state.get("participant_code", "") if new_state else ""
-        # После END_GAME блокируем поле и кнопку
-        if new_state and new_state.get("game_ended"):
-            field_update = gr.update(
-                interactive=False,
-                placeholder="Сессия завершена. Спасибо за участие.",
-            )
-        else:
-            field_update = gr.update()
-        return msg_out, disp, new_state, uuid_value, field_update, field_update
+        return msg_out, disp, new_state, uuid_value
 
     demo.load(fn=_ui_load, outputs=[session, chatbot, uuid_bridge])
     demo.load(fn=None, inputs=None, outputs=None, js=HIDE_JS)
     msg.submit(fn=_respond_with_uuid, inputs=[msg, session],
-               outputs=[msg, chatbot, session, uuid_bridge, msg, send_btn])
+               outputs=[msg, chatbot, session, uuid_bridge])
     send_btn.click(fn=_respond_with_uuid, inputs=[msg, session],
-                   outputs=[msg, chatbot, session, uuid_bridge, msg, send_btn])
+                   outputs=[msg, chatbot, session, uuid_bridge])
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 7860))
     demo.launch(
-        server_name="0.0.0.0",
-        server_port=port,
         theme=gr.themes.Default(primary_hue="slate", neutral_hue="slate", radius_size="sm"),
         css=CSS,
+        # Gradio 6: show_api удалён, заменён на footer_links.
+        # Чтобы скрыть ссылку API из футера: указываем список без "api".
         footer_links=["gradio", "settings"],
     )
